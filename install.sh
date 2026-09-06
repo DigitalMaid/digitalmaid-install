@@ -87,13 +87,20 @@ if [ -n "$TARBALL" ]; then
   SRC="$TARBALL"
 else
   have curl || fail "curl is required"
+  RAW="https://raw.githubusercontent.com/$RELEASES_REPO/main/releases"
   if [ "$VERSION" = "latest" ]; then
-    URL="https://github.com/$RELEASES_REPO/releases/latest/download/digitalmaid.tar.gz"
-  else
-    URL="https://github.com/$RELEASES_REPO/releases/download/v$VERSION/digitalmaid.tar.gz"
+    VERSION="$(curl -fsSL "$RAW/LATEST" | tr -d '[:space:]')" || fail "could not read the latest version"
   fi
+  URL="$RAW/v$VERSION/digitalmaid-$VERSION.tar.gz"
   SRC="$(mktemp -t digitalmaid.XXXXXX.tar.gz)"
   curl -fsSL "$URL" -o "$SRC" || fail "could not download $URL"
+  # Integrity: compare against the SHA256SUMS published next to the tarball.
+  SUMS="$(curl -fsSL "$RAW/v$VERSION/SHA256SUMS" 2>/dev/null || true)"
+  if [ -n "$SUMS" ]; then
+    WANT="$(printf '%s\n' "$SUMS" | awk -v f="digitalmaid-$VERSION.tar.gz" '$2==f{print $1}')"
+    if have sha256sum; then GOT="$(sha256sum "$SRC" | awk '{print $1}')"; else GOT="$(shasum -a 256 "$SRC" | awk '{print $1}')"; fi
+    [ -z "$WANT" ] || [ "$WANT" = "$GOT" ] || fail "checksum mismatch for digitalmaid-$VERSION.tar.gz"
+  fi
 fi
 rm -rf "$APP.new"; mkdir -p "$APP.new"
 tar -xzf "$SRC" -C "$APP.new" --strip-components=1

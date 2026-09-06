@@ -55,8 +55,8 @@ Everything works without any API key. To let the built-in agent roles run automa
 
 - The UI binds to `127.0.0.1` only. For a team server, see `docs/INSTALL.md` inside the app (HTTPS reverse proxy required).
 - Passwords are stored as salted scrypt hashes; the installer never writes a password anywhere.
-- The install script downloads exactly two things: `uv` from astral.sh (if missing) and the release tarball from this repository's Releases page. Verify with `SHA256SUMS` attached to each release.
+- The install script downloads exactly two things: `uv` from astral.sh (if missing) and the release tarball from this repository. The SHA-256 is verified against `SHA256SUMS` before anything is installed.
 
 ## Releases
 
-Each release ships `digitalmaid-<version>.tar.gz`, `digitalmaid.tar.gz` (same file, stable name for `latest`) and `SHA256SUMS`.
+Release tarballs live in `releases/v<version>/` in this repository (`digitalmaid-<version>.tar.gz` + `SHA256SUMS`); `releases/LATEST` names the current version. The installer verifies the checksum before installing.
