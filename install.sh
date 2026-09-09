@@ -14,6 +14,11 @@
 #   --prefix DIR          install location (default: ~/.digitalmaid, or /opt/digitalmaid as root)
 #   --port N              local port for the UI (default: 8765)
 #   --from-tarball FILE   install from a local release tarball (offline / testing)
+#   --hermes              also install the Hermes Agent dashboard plugin (DigitalMaid tab, single sign-on)
+#   --hermes-home DIR     Hermes home holding plugins/ and config.yaml (default: ~/.hermes of the user running this)
+#
+# Uninstall: the owner can do it from Settings → Uninstall in the app (a flag file that a systemd
+# path unit picks up; the app never runs as root), or run PREFIX/bin/digitalmaid-uninstall [--purge].
 #
 # What it does, idempotently: uv → Python 3.12 → the app under PREFIX/app → a workspace under
 # PREFIX/workspace → your owner account → background services → health check.
@@ -27,6 +32,7 @@ set -euo pipefail
 
 RELEASES_REPO="DigitalMaid/digitalmaid-install"
 VERSION="latest"; DEMO="no"; SERVICE="yes"; PORT="8765"; TARBALL=""; DOMAIN=""; PREFIX="${DIGITALMAID_PREFIX:-}"
+HERMES="no"; HERMES_HOME="${DIGITALMAID_HERMES_HOME:-}"; INVOKER_HOME="$HOME"
 while [ $# -gt 0 ]; do
   case "$1" in
     --demo) DEMO="yes"; shift ;;
@@ -36,7 +42,9 @@ while [ $# -gt 0 ]; do
     --prefix) PREFIX="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --from-tarball) TARBALL="$2"; shift 2 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --hermes) HERMES="yes"; shift ;;
+    --hermes-home) HERMES_HOME="$2"; HERMES="yes"; shift 2 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -87,13 +95,20 @@ SYSTEMD_DIR="${DIGITALMAID_SYSTEMD_DIR:-/etc/systemd/system}"   # overridable fo
 CADDYFILE="${DIGITALMAID_CADDYFILE:-/etc/caddy/Caddyfile}"
 
 APP="$PREFIX/app"; VENV="$PREFIX/venv"; ROOT="$PREFIX/workspace"; BIN="$PREFIX/bin"
-mkdir -p "$PREFIX" "$BIN"
+# The web app can ask for an uninstall by writing $UNINSTALL_DIR/request.json (owner only,
+# password re-entry). A root-owned systemd path unit watches for it; the app never gets root.
+UNINSTALL_DIR="$PREFIX/uninstall"
+mkdir -p "$PREFIX" "$BIN" "$UNINSTALL_DIR"
 
 bold ""
 bold "  DigitalMaid Agentic OS"
 printf '  installing to %s' "$PREFIX"
 [ "$MODE" = "system" ] && printf ' (runs as user %s)' "$SVC_USER"; printf '\n'
-TOTAL=6; [ -n "$DOMAIN" ] && TOTAL=7
+TOTAL=6; [ -n "$DOMAIN" ] && TOTAL=7; [ "$HERMES" = "yes" ] && TOTAL=$((TOTAL+1))
+HERMES_HOME="${HERMES_HOME:-$INVOKER_HOME/.hermes}"
+# The trusted-proxy secret shared with the Hermes plugin lives outside the unit files
+# (units are world-readable): the service reads it from this 0600 EnvironmentFile.
+HERMES_ENV="$PREFIX/hermes.env"
 
 step "1/$TOTAL uv (Python manager)"
 UV="$(command -v uv 2>/dev/null || true)"
@@ -177,15 +192,38 @@ else
 fi
 printf '%s\n' "$SCOPE" > "$PREFIX/scope"
 if [ "$MODE" = "system" ]; then chown -R "$SVC_USER:$SVC_USER" "$PREFIX"; chmod 750 "$PREFIX"; fi
+chmod 750 "$UNINSTALL_DIR"
 
 step "5/$TOTAL Background services"
 REMOTE=""; [ -n "$DOMAIN" ] && REMOTE=" --allow-remote"
 SERVE_CMD="$VENV/bin/digitalmaid serve --root $ROOT --scope $SCOPE --host 127.0.0.1 --port $PORT$REMOTE"
 WORKER_CMD="$VENV/bin/digitalmaid worker --loop --root $ROOT --scope $SCOPE"
+# One-click uninstall from the app: a path unit fires the oneshot when the app has written the
+# request file. In system mode the oneshot runs as root (no User=), the only place root is used.
+write_uninstall_units() { # dir wanted-by
+  cat > "$1/digitalmaid-uninstall.path" <<EOF
+[Unit]
+Description=DigitalMaid Agentic OS (watch for an uninstall request from the app)
+[Path]
+PathExists=$UNINSTALL_DIR/request.json
+Unit=digitalmaid-uninstall.service
+[Install]
+WantedBy=$2
+EOF
+  cat > "$1/digitalmaid-uninstall.service" <<EOF
+[Unit]
+Description=DigitalMaid Agentic OS (uninstall requested from the app)
+[Service]
+Type=oneshot
+ExecStart=$BIN/digitalmaid-uninstall --from-request $UNINSTALL_DIR/request.json
+EOF
+}
 cat > "$BIN/digitalmaid-start" <<EOF
 #!/usr/bin/env bash
 # Start the DigitalMaid UI and worker in the foreground (Ctrl+C stops both).
 set -e
+export DIGITALMAID_INSTALL_MODE=$MODE
+if [ -f "$HERMES_ENV" ]; then set -a; . "$HERMES_ENV"; set +a; fi
 trap 'kill 0' EXIT
 $WORKER_CMD &
 exec $SERVE_CMD
@@ -201,13 +239,17 @@ After=network.target
 [Service]
 User=$SVC_USER
 Group=$SVC_USER
+Environment=DIGITALMAID_UNINSTALL_DIR=$UNINSTALL_DIR
+Environment=DIGITALMAID_INSTALL_MODE=system
+# Hermes dashboard plugin (--hermes): DIGITALMAID_TRUSTED_PROXY_SECRET=... lives in this 0600 file.
+EnvironmentFile=-$HERMES_ENV
 ExecStart=$SERVE_CMD
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$ROOT
+ReadWritePaths=$ROOT $UNINSTALL_DIR
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -224,17 +266,20 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$ROOT
+ReadWritePaths=$ROOT $UNINSTALL_DIR
 # To let live AI agents run: put DIGITALMAID_LLM_API_KEY=... in $PREFIX/env (chown root, chmod 600) and uncomment:
 # EnvironmentFile=-$PREFIX/env
 [Install]
 WantedBy=multi-user.target
 EOF
+  write_uninstall_units "$SYSTEMD_DIR" multi-user.target
   systemctl daemon-reload
   systemctl enable --now digitalmaid.service digitalmaid-worker.service >/dev/null 2>&1 || true
   systemctl restart digitalmaid.service digitalmaid-worker.service >/dev/null 2>&1 || true
+  systemctl enable --now digitalmaid-uninstall.path >/dev/null 2>&1 || true
   STARTED="yes"; STATUS_HINT="systemctl status digitalmaid digitalmaid-worker"
   ok "system services: digitalmaid, digitalmaid-worker (run as $SVC_USER, start at boot)"
+  ok "uninstall watcher: digitalmaid-uninstall.path (Settings → Uninstall in the app)"
 elif [ "$SERVICE" = "yes" ] && [ "$OS" = "Linux" ] && have systemctl && systemctl --user show-environment >/dev/null 2>&1; then
   UNITS="$HOME/.config/systemd/user"; mkdir -p "$UNITS"
   cat > "$UNITS/digitalmaid.service" <<EOF
@@ -242,6 +287,10 @@ elif [ "$SERVICE" = "yes" ] && [ "$OS" = "Linux" ] && have systemctl && systemct
 Description=DigitalMaid Agentic OS (web UI)
 After=network.target
 [Service]
+Environment=DIGITALMAID_UNINSTALL_DIR=$UNINSTALL_DIR
+Environment=DIGITALMAID_INSTALL_MODE=user
+# Hermes dashboard plugin (--hermes): DIGITALMAID_TRUSTED_PROXY_SECRET=... lives in this 0600 file.
+EnvironmentFile=-$HERMES_ENV
 ExecStart=$SERVE_CMD
 Restart=on-failure
 RestartSec=3
@@ -264,9 +313,13 @@ EOF
   systemctl --user daemon-reload
   systemctl --user enable --now digitalmaid.service digitalmaid-worker.service >/dev/null 2>&1 || true
   systemctl --user restart digitalmaid.service digitalmaid-worker.service >/dev/null 2>&1 || true
+  write_uninstall_units "$UNITS" default.target
+  systemctl --user daemon-reload
+  systemctl --user enable --now digitalmaid-uninstall.path >/dev/null 2>&1 || true
   loginctl enable-linger "$SVC_USER" >/dev/null 2>&1 || true
   STARTED="yes"; STATUS_HINT="systemctl --user status digitalmaid digitalmaid-worker"
   ok "systemd user services: digitalmaid, digitalmaid-worker (start at login)"
+  ok "uninstall watcher: digitalmaid-uninstall.path (Settings → Uninstall in the app)"
 elif [ "$SERVICE" = "yes" ] && [ "$OS" = "Darwin" ]; then
   AGENTS="$HOME/Library/LaunchAgents"; mkdir -p "$AGENTS" "$PREFIX/logs"
   plist() { # label, command...
@@ -328,6 +381,103 @@ EOF
   ok "https://$DOMAIN → 127.0.0.1:$PORT"
 fi
 
+if [ "$HERMES" = "yes" ]; then
+  step "$((TOTAL-1))/$TOTAL Hermes dashboard plugin"
+  PLUGIN_SRC="$APP/hermes-plugin/digitalmaid"
+  [ -d "$PLUGIN_SRC" ] || fail "this release has no hermes-plugin/ folder (needs digitalmaid >= 0.3.0)"
+  [ -d "$HERMES_HOME" ] || fail "Hermes home not found: $HERMES_HOME (pass --hermes-home DIR; Hermes keeps plugins/ and config.yaml there)"
+  # One shared secret (>= 32 chars): the app trusts loopback requests that carry it.
+  SECRET_FILE="$PREFIX/hermes-secret"
+  if [ ! -s "$SECRET_FILE" ] || [ "$(wc -c < "$SECRET_FILE")" -lt 32 ]; then
+    if have openssl; then SECRET="$(openssl rand -hex 32)"; else SECRET="$("$VENV/bin/python" -c 'import secrets; print(secrets.token_hex(32))')"; fi
+    (umask 077; printf '%s\n' "$SECRET" > "$SECRET_FILE")
+    unset SECRET
+  fi
+  chmod 600 "$SECRET_FILE"
+  (umask 077; printf 'DIGITALMAID_TRUSTED_PROXY_SECRET=%s\n' "$(cat "$SECRET_FILE")" > "$HERMES_ENV")
+  chmod 600 "$HERMES_ENV"
+  [ "$MODE" != "system" ] || chown "$SVC_USER:$SVC_USER" "$SECRET_FILE" "$HERMES_ENV"
+  # The plugin package goes where Hermes discovers user plugins; its own copy of the secret
+  # is readable by the Hermes process only (Hermes may run as a different user).
+  PLUGIN_DEST="$HERMES_HOME/plugins/digitalmaid"
+  mkdir -p "$HERMES_HOME/plugins"
+  rm -rf "$PLUGIN_DEST.new"; cp -R "$PLUGIN_SRC" "$PLUGIN_DEST.new"
+  rm -rf "$PLUGIN_DEST"; mv "$PLUGIN_DEST.new" "$PLUGIN_DEST"
+  (umask 077; cat "$SECRET_FILE" > "$PLUGIN_DEST/secret")
+  chmod 600 "$PLUGIN_DEST/secret"
+  printf '{"upstream": "http://127.0.0.1:%s", "secret_file": "%s/secret"}\n' "$PORT" "$PLUGIN_DEST" > "$PLUGIN_DEST/dashboard/config.json"
+  HERMES_OWNER="$(stat -c '%u:%g' "$HERMES_HOME" 2>/dev/null || stat -f '%u:%g' "$HERMES_HOME")"
+  [ "$(id -u)" != "0" ] || chown -R "$HERMES_OWNER" "$PLUGIN_DEST"
+  printf '%s\n' "$HERMES_HOME" > "$PREFIX/hermes-home"
+  ok "plugin copied to $PLUGIN_DEST (secret: $PLUGIN_DEST/secret, mode 600)"
+  # Hermes only imports a user plugin's backend when it is listed under plugins.enabled.
+  # Edit the YAML as text so the owner's comments survive; back the file up first.
+  HCFG="$HERMES_HOME/config.yaml"
+  if [ -f "$HCFG" ]; then cp -p "$HCFG" "$HCFG.before-digitalmaid"; fi
+  "$VENV/bin/python" - "$HCFG" <<'PYEOF'
+import re, sys
+from pathlib import Path
+path = Path(sys.argv[1]); name = "digitalmaid"
+text = path.read_text(encoding="utf-8") if path.is_file() else ""
+lines = text.splitlines()
+
+def block_end(start):
+    """Index just past the last line that belongs to the top-level key at lines[start]."""
+    i = start + 1
+    while i < len(lines) and (not lines[i].strip() or lines[i][0] in " \t" or lines[i].lstrip().startswith("#")):
+        i += 1
+    return i
+
+top = next((i for i, l in enumerate(lines) if re.match(r"^plugins\s*:\s*(#.*)?$", l)), None)
+if top is None:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines += ["plugins:", f"  enabled: [{name}]"]
+else:
+    end = block_end(top)
+    en = next((i for i in range(top + 1, end) if re.match(r"^\s+enabled\s*:", lines[i])), None)
+    if en is None:
+        lines.insert(top + 1, f"  enabled: [{name}]")
+    else:
+        m = re.match(r"^(\s+)enabled\s*:\s*(.*?)\s*$", lines[en])
+        indent, rest = m.group(1), m.group(2)
+        if rest.startswith("["):                      # flow list: enabled: [a, b]
+            inner = rest[1:rest.rfind("]")]
+            items = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
+            if name not in items:
+                items.append(name)
+                lines[en] = f"{indent}enabled: [{', '.join(items)}]"
+        elif rest in ("", "~", "null"):               # block list: "- a" lines follow
+            last = None; item_indent = None
+            for j in range(en + 1, end):
+                mm = re.match(r"^(\s+)-\s*(.*?)\s*$", lines[j])
+                if mm and len(mm.group(1)) >= len(indent):
+                    last, item_indent = j, mm.group(1)
+                elif lines[j].strip() and not lines[j].lstrip().startswith("#"):
+                    break
+            items = [re.match(r"^\s+-\s*(.*?)\s*$", lines[k]).group(1).strip("'\"")
+                     for k in range(en + 1, (last if last is not None else en) + 1)
+                     if re.match(r"^\s+-", lines[k])]
+            if name not in items:
+                if last is None:
+                    lines[en] = f"{indent}enabled: [{name}]"
+                else:
+                    lines.insert(last + 1, f"{item_indent}- {name}")
+        else:
+            sys.exit(f"could not understand the plugins.enabled line in {path}: {lines[en]!r}; add '{name}' to plugins.enabled by hand")
+    if any(re.match(r"^\s+disabled\s*:.*\b" + name + r"\b", lines[i]) for i in range(top + 1, block_end(top))):
+        print(f"   ! {name} is also listed under plugins.disabled in {path}; remove it there")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PYEOF
+  [ "$(id -u)" != "0" ] || chown "$HERMES_OWNER" "$HCFG"
+  ok "enabled in $HCFG (plugins.enabled)$([ -f "$HCFG.before-digitalmaid" ] && printf ' — backup: %s.before-digitalmaid' "$HCFG")"
+  ok "Hermes plugin installed at $PLUGIN_DEST — restart the Hermes dashboard to see the DigitalMaid tab"
+  # The app must re-read its EnvironmentFile; Hermes itself is never restarted by this script.
+  if [ "$STARTED" = "yes" ] && [ "$MODE" = "system" ] && have systemctl; then systemctl restart digitalmaid.service >/dev/null 2>&1 || true
+  elif [ "$STARTED" = "yes" ] && [ "$OS" = "Linux" ] && have systemctl; then systemctl --user restart digitalmaid.service >/dev/null 2>&1 || true; fi
+fi
+
 step "$TOTAL/$TOTAL Health check"
 LOCAL="http://127.0.0.1:$PORT"; URL="$LOCAL"; [ -n "$DOMAIN" ] && URL="https://$DOMAIN"
 HEALTHY="no"
@@ -356,24 +506,57 @@ fi
 cat > "$BIN/digitalmaid-uninstall" <<EOF
 #!/usr/bin/env bash
 # Removes the app and services. Your workspace ($ROOT) is kept unless you pass --purge.
+#   --from-request FILE   honour a request the app wrote (Settings → Uninstall); "purge" comes from the file
 set -e
+# This script deletes its own directory: run from a temporary copy (guarded against recursion).
+if [ -z "\${DIGITALMAID_UNINSTALL_RELAUNCHED:-}" ]; then
+  T="\$(mktemp -t digitalmaid-uninstall.XXXXXX)"; cp "\$0" "\$T"; chmod 700 "\$T"
+  DIGITALMAID_UNINSTALL_RELAUNCHED=1 exec bash "\$T" "\$@"
+fi
+trap 'rm -f "\$0"' EXIT
+PURGE=0; REQUEST=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    --purge) PURGE=1; shift ;;
+    --from-request) REQUEST="\$2"; shift 2 ;;
+    -h|--help) sed -n '2,3p' "\$0"; exit 0 ;;
+    *) echo "unknown argument: \$1" >&2; exit 2 ;;
+  esac
+done
+if [ -n "\$REQUEST" ]; then
+  [ -f "\$REQUEST" ] || { echo "request file not found: \$REQUEST" >&2; exit 1; }
+  # Read "purge" while the venv still exists; anything unreadable means: keep the data.
+  P="\$("$VENV/bin/python" -c 'import json,sys; print("1" if json.load(open(sys.argv[1])).get("purge") is True else "0")' "\$REQUEST" 2>/dev/null || echo 0)"
+  [ "\$P" = 1 ] && PURGE=1
+  echo "uninstall requested from the app: \$(cat "\$REQUEST" 2>/dev/null || true)"
+fi
 if [ "$MODE" = system ]; then
   [ "\$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
   systemctl disable --now digitalmaid.service digitalmaid-worker.service 2>/dev/null || true
-  rm -f "$SYSTEMD_DIR/digitalmaid.service" "$SYSTEMD_DIR/digitalmaid-worker.service"; systemctl daemon-reload 2>/dev/null || true
+  # The watcher goes away too; the oneshot it may have started is this very process, so it is only disabled, never stopped.
+  systemctl disable --now digitalmaid-uninstall.path 2>/dev/null || true
+  systemctl disable digitalmaid-uninstall.service 2>/dev/null || true
+  rm -f "$SYSTEMD_DIR/digitalmaid.service" "$SYSTEMD_DIR/digitalmaid-worker.service" "$SYSTEMD_DIR/digitalmaid-uninstall.path" "$SYSTEMD_DIR/digitalmaid-uninstall.service"
+  systemctl daemon-reload 2>/dev/null || true
   if [ -f "$CADDYFILE" ] && grep -q '# digitalmaid:begin' "$CADDYFILE"; then
     T="\$(mktemp)"; awk '/# digitalmaid:begin/{skip=1} !skip{print} /# digitalmaid:end/{skip=0}' "$CADDYFILE" > "\$T"; mv "\$T" "$CADDYFILE"
     [ -f "$CADDYFILE.before-digitalmaid" ] && mv "$CADDYFILE.before-digitalmaid" "$CADDYFILE"
     systemctl reload caddy 2>/dev/null || true
   fi
-  rm -f /usr/local/bin/digitalmaid
+  rm -f /usr/local/bin/digitalmaid /usr/local/bin/digitalmaid-uninstall
 elif command -v systemctl >/dev/null 2>&1; then
-  systemctl --user disable --now digitalmaid.service digitalmaid-worker.service 2>/dev/null || true
-  rm -f "$HOME/.config/systemd/user/digitalmaid.service" "$HOME/.config/systemd/user/digitalmaid-worker.service"; systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user disable --now digitalmaid.service digitalmaid-worker.service digitalmaid-uninstall.path 2>/dev/null || true
+  systemctl --user disable digitalmaid-uninstall.service 2>/dev/null || true
+  rm -f "$HOME/.config/systemd/user/digitalmaid.service" "$HOME/.config/systemd/user/digitalmaid-worker.service" "$HOME/.config/systemd/user/digitalmaid-uninstall.path" "$HOME/.config/systemd/user/digitalmaid-uninstall.service"
+  systemctl --user daemon-reload 2>/dev/null || true
 fi
 if [ "\$(uname -s)" = Darwin ]; then for l in com.digitalmaid.serve com.digitalmaid.worker; do launchctl bootout "gui/\$(id -u)/\$l" 2>/dev/null || true; rm -f "$HOME/Library/LaunchAgents/\$l.plist"; done; fi
-rm -rf "$APP" "$VENV" "$BIN" "$PREFIX/uv" "$PREFIX/python" "$PREFIX/cache" "$PREFIX/home" "$PREFIX/scope"
-if [ "\${1:-}" = "--purge" ]; then
+if [ -f "$PREFIX/hermes-home" ]; then
+  HH="\$(cat "$PREFIX/hermes-home")"
+  if [ -d "\$HH/plugins/digitalmaid" ]; then rm -rf "\$HH/plugins/digitalmaid"; echo "Hermes plugin removed from \$HH/plugins (remove 'digitalmaid' from plugins.enabled in \$HH/config.yaml and restart the Hermes dashboard)"; fi
+fi
+rm -rf "$APP" "$VENV" "$BIN" "$UNINSTALL_DIR" "$PREFIX/uv" "$PREFIX/python" "$PREFIX/cache" "$PREFIX/home" "$PREFIX/scope" "$PREFIX/hermes-secret" "$PREFIX/hermes.env" "$PREFIX/hermes-home"
+if [ "\$PURGE" = 1 ]; then
   rm -rf "$ROOT" "$PREFIX"; echo "workspace removed"
   [ "$MODE" = system ] && userdel "$SVC_USER" 2>/dev/null && rm -rf "/var/lib/$SVC_USER" && echo "user $SVC_USER removed" || true
 else
@@ -397,8 +580,9 @@ if [ "$DEMO" = "yes" ]; then printf '  Sign in:   demo / the password printed ab
 printf '  Command:   digitalmaid\n'
 printf '  Status:    %s\n' "$STATUS_HINT"
 printf '  Upgrade:   re-run this same install command\n'
-printf '  Uninstall: %s  (add --purge to delete your data too)\n' "$( [ "$MODE" = system ] && echo digitalmaid-uninstall || echo "$BIN/digitalmaid-uninstall")"
+printf '  Uninstall: Settings → Uninstall in the app (owner), or %s  (add --purge to delete your data too)\n' "$( [ "$MODE" = system ] && echo digitalmaid-uninstall || echo "$BIN/digitalmaid-uninstall")"
 printf '  Docs:      %s/docs/  (INSTALL.md, OPERATIONS.md, LIVE-AGENT.md for AI keys)\n' "$APP"
+if [ "$HERMES" = "yes" ]; then printf '  Hermes:    restart the Hermes dashboard, then open its DigitalMaid tab (plugin: %s)\n' "$HERMES_HOME/plugins/digitalmaid"; fi
 if [ "$STARTED" = "yes" ] && [ "$MODE" = "user" ] && [ -t 1 ]; then
   if [ "$OS" = "Darwin" ]; then open "$URL" 2>/dev/null || true; elif have xdg-open; then xdg-open "$URL" >/dev/null 2>&1 || true; fi
 fi
