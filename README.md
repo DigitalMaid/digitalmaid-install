@@ -30,7 +30,7 @@ Requirements: Linux or macOS, `curl`. Python and `uv` are installed for you if m
 
 ```
 --demo            seed the fictional "Northwind Ferments" workspace
---version 0.1.0   install a specific release (default: latest)
+--version 0.2.0   install a specific release (default: latest)
 --port 8765       local port for the UI
 --prefix DIR      install somewhere other than ~/.digitalmaid
 --no-service      don't register background services; use digitalmaid-start
