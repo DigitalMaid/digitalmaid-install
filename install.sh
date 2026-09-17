@@ -16,6 +16,9 @@
 #   --from-tarball FILE   install from a local release tarball (offline / testing)
 #   --hermes              also install the Hermes Agent dashboard plugin (DigitalMaid tab, single sign-on)
 #   --hermes-home DIR     Hermes home holding plugins/ and config.yaml (default: ~/.hermes of the user running this)
+#   --hermes-docker NAME  Hermes runs in the Docker container NAME on this host (e.g. the Hostinger template):
+#                         the plugin then reaches DigitalMaid over the docker bridge; --hermes-home may be
+#                         omitted (read from the container's mounts)
 #
 # Uninstall: the owner can do it from Settings → Uninstall in the app (a flag file that a systemd
 # path unit picks up; the app never runs as root), or run PREFIX/bin/digitalmaid-uninstall [--purge].
@@ -32,7 +35,7 @@ set -euo pipefail
 
 RELEASES_REPO="DigitalMaid/digitalmaid-install"
 VERSION="latest"; DEMO="no"; SERVICE="yes"; PORT="8765"; TARBALL=""; DOMAIN=""; PREFIX="${DIGITALMAID_PREFIX:-}"
-HERMES="no"; HERMES_HOME="${DIGITALMAID_HERMES_HOME:-}"; INVOKER_HOME="$HOME"
+HERMES="no"; HERMES_HOME="${DIGITALMAID_HERMES_HOME:-}"; HERMES_DOCKER=""; INVOKER_HOME="$HOME"
 while [ $# -gt 0 ]; do
   case "$1" in
     --demo) DEMO="yes"; shift ;;
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
     --from-tarball) TARBALL="$2"; shift 2 ;;
     --hermes) HERMES="yes"; shift ;;
     --hermes-home) HERMES_HOME="$2"; HERMES="yes"; shift 2 ;;
+    --hermes-docker) HERMES_DOCKER="$2"; HERMES="yes"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -105,6 +109,7 @@ bold "  DigitalMaid Agentic OS"
 printf '  installing to %s' "$PREFIX"
 [ "$MODE" = "system" ] && printf ' (runs as user %s)' "$SVC_USER"; printf '\n'
 TOTAL=6; [ -n "$DOMAIN" ] && TOTAL=7; [ "$HERMES" = "yes" ] && TOTAL=$((TOTAL+1))
+HERMES_HOME_GIVEN="$HERMES_HOME"
 HERMES_HOME="${HERMES_HOME:-$INVOKER_HOME/.hermes}"
 # The trusted-proxy secret shared with the Hermes plugin lives outside the unit files
 # (units are world-readable): the service reads it from this 0600 EnvironmentFile.
@@ -196,7 +201,26 @@ chmod 750 "$UNINSTALL_DIR"
 
 step "5/$TOTAL Background services"
 REMOTE=""; [ -n "$DOMAIN" ] && REMOTE=" --allow-remote"
-SERVE_CMD="$VENV/bin/digitalmaid serve --root $ROOT --scope $SCOPE --host 127.0.0.1 --port $PORT$REMOTE"
+BIND="127.0.0.1"; BRIDGE_GW=""; BRIDGE_NET=""; HERMES_ENV_EXTRA=""; AFTER_DOCKER=""
+if [ -n "$HERMES_DOCKER" ]; then
+  # Hermes lives in a container: it reaches this host through the docker network's gateway.
+  # DigitalMaid binds to that gateway address too (still not the public interface), and the
+  # app trusts the SSO handshake from that subnet, not only from loopback.
+  have docker || fail "--hermes-docker given but docker is not on PATH"
+  docker inspect "$HERMES_DOCKER" >/dev/null 2>&1 || fail "no container named '$HERMES_DOCKER' (docker ps --format '{{.Names}}')"
+  BRIDGE_GW="$(docker inspect "$HERMES_DOCKER" --format '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}' | awk '{print $1}')"
+  BRIDGE_NET="$(docker inspect "$HERMES_DOCKER" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}/{{.IPPrefixLen}} {{end}}' | awk '{print $1}')"
+  [ -n "$BRIDGE_GW" ] && [ -n "$BRIDGE_NET" ] || fail "could not read the container's network gateway (docker inspect $HERMES_DOCKER)"
+  BIND="$BRIDGE_GW"; REMOTE=" --allow-remote"; AFTER_DOCKER=" docker.service"
+  HERMES_ENV_EXTRA="DIGITALMAID_TRUSTED_PROXY_CLIENTS=$BRIDGE_NET"
+  if [ -z "$HERMES_HOME_GIVEN" ]; then
+    HERMES_HOME="$(docker inspect "$HERMES_DOCKER" --format '{{range .Mounts}}{{if eq .Destination "/opt/data"}}{{.Source}}{{end}}{{end}}')"
+    [ -n "$HERMES_HOME" ] || HERMES_HOME="$(docker inspect "$HERMES_DOCKER" --format '{{range .Mounts}}{{if eq .Destination "/root/.hermes"}}{{.Source}}{{end}}{{end}}')"
+    [ -n "$HERMES_HOME" ] || fail "could not find the Hermes home mount of $HERMES_DOCKER; pass --hermes-home HOST_DIR"
+  fi
+  ok "Hermes container $HERMES_DOCKER: gateway $BRIDGE_GW, subnet $BRIDGE_NET, home $HERMES_HOME"
+fi
+SERVE_CMD="$VENV/bin/digitalmaid serve --root $ROOT --scope $SCOPE --host $BIND --port $PORT$REMOTE"
 WORKER_CMD="$VENV/bin/digitalmaid worker --loop --root $ROOT --scope $SCOPE"
 # One-click uninstall from the app: a path unit fires the oneshot when the app has written the
 # request file. In system mode the oneshot runs as root (no User=), the only place root is used.
@@ -235,7 +259,7 @@ if [ "$SERVICE" = "yes" ] && [ "$MODE" = "system" ] && have systemctl; then
   cat > "$SYSTEMD_DIR/digitalmaid.service" <<EOF
 [Unit]
 Description=DigitalMaid Agentic OS (web UI)
-After=network.target
+After=network.target${AFTER_DOCKER}
 [Service]
 User=$SVC_USER
 Group=$SVC_USER
@@ -285,7 +309,7 @@ elif [ "$SERVICE" = "yes" ] && [ "$OS" = "Linux" ] && have systemctl && systemct
   cat > "$UNITS/digitalmaid.service" <<EOF
 [Unit]
 Description=DigitalMaid Agentic OS (web UI)
-After=network.target
+After=network.target${AFTER_DOCKER}
 [Service]
 Environment=DIGITALMAID_UNINSTALL_DIR=$UNINSTALL_DIR
 Environment=DIGITALMAID_INSTALL_MODE=user
@@ -366,7 +390,7 @@ if [ -n "$DOMAIN" ]; then
   cat >> "$TMP" <<EOF
 # digitalmaid:begin (managed by the DigitalMaid installer)
 $DOMAIN {
-    reverse_proxy 127.0.0.1:$PORT
+    reverse_proxy $BIND:$PORT
     header Strict-Transport-Security "max-age=31536000"
 }
 # digitalmaid:end
@@ -394,7 +418,7 @@ if [ "$HERMES" = "yes" ]; then
     unset SECRET
   fi
   chmod 600 "$SECRET_FILE"
-  (umask 077; printf 'DIGITALMAID_TRUSTED_PROXY_SECRET=%s\n' "$(cat "$SECRET_FILE")" > "$HERMES_ENV")
+  (umask 077; { printf 'DIGITALMAID_TRUSTED_PROXY_SECRET=%s\n' "$(cat "$SECRET_FILE")"; [ -z "$HERMES_ENV_EXTRA" ] || printf '%s\n' "$HERMES_ENV_EXTRA"; } > "$HERMES_ENV")
   chmod 600 "$HERMES_ENV"
   [ "$MODE" != "system" ] || chown "$SVC_USER:$SVC_USER" "$SECRET_FILE" "$HERMES_ENV"
   # The plugin package goes where Hermes discovers user plugins; its own copy of the secret
@@ -405,7 +429,14 @@ if [ "$HERMES" = "yes" ]; then
   rm -rf "$PLUGIN_DEST"; mv "$PLUGIN_DEST.new" "$PLUGIN_DEST"
   (umask 077; cat "$SECRET_FILE" > "$PLUGIN_DEST/secret")
   chmod 600 "$PLUGIN_DEST/secret"
-  printf '{"upstream": "http://127.0.0.1:%s", "secret_file": "%s/secret"}\n' "$PORT" "$PLUGIN_DEST" > "$PLUGIN_DEST/dashboard/config.json"
+  UPSTREAM_HOST="127.0.0.1"; [ -z "$BRIDGE_GW" ] || UPSTREAM_HOST="$BRIDGE_GW"
+  # Inside the container the plugin's secret_file is the container path of the same file.
+  SECRET_IN_HERMES="$PLUGIN_DEST/secret"
+  if [ -n "$HERMES_DOCKER" ]; then
+    CONTAINER_HOME="$(docker inspect "$HERMES_DOCKER" --format "{{range .Mounts}}{{if eq .Source \"$HERMES_HOME\"}}{{.Destination}}{{end}}{{end}}")"
+    [ -z "$CONTAINER_HOME" ] || SECRET_IN_HERMES="$CONTAINER_HOME/plugins/digitalmaid/secret"
+  fi
+  printf '{"upstream": "http://%s:%s", "secret_file": "%s"}\n' "$UPSTREAM_HOST" "$PORT" "$SECRET_IN_HERMES" > "$PLUGIN_DEST/dashboard/config.json"
   HERMES_OWNER="$(stat -c '%u:%g' "$HERMES_HOME" 2>/dev/null || stat -f '%u:%g' "$HERMES_HOME")"
   [ "$(id -u)" != "0" ] || chown -R "$HERMES_OWNER" "$PLUGIN_DEST"
   printf '%s\n' "$HERMES_HOME" > "$PREFIX/hermes-home"
@@ -479,7 +510,7 @@ PYEOF
 fi
 
 step "$TOTAL/$TOTAL Health check"
-LOCAL="http://127.0.0.1:$PORT"; URL="$LOCAL"; [ -n "$DOMAIN" ] && URL="https://$DOMAIN"
+LOCAL="http://$BIND:$PORT"; URL="$LOCAL"; [ -n "$DOMAIN" ] && URL="https://$DOMAIN"
 HEALTHY="no"
 if [ "$STARTED" = "yes" ]; then
   for _ in $(seq 1 40); do curl -fsS "$LOCAL/api/healthz" >/dev/null 2>&1 && { HEALTHY="yes"; break; }; sleep 0.5; done
